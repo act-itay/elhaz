@@ -62,6 +62,8 @@ Commands
      - Execute a one-off command with injected AWS credentials.
    * - :ref:`export <elhaz-export>`
      - Export credentials in multiple formats.
+   * - :ref:`generate-aws-config <elhaz-generate-aws-config>`
+     - Print an AWS config file for all elhaz configs.
    * - :ref:`shell <elhaz-shell>`
      - Spawn an interactive shell with auto-refreshed credentials.
    * - :ref:`whoami <elhaz-whoami>`

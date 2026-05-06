@@ -23,9 +23,14 @@ from typing import Optional
 
 import typer
 
+from elhaz.config import Config
 from elhaz.constants import Constants
 from elhaz.daemon import Client
-from elhaz.exceptions import ElhazDaemonError
+from elhaz.exceptions import (
+    ElhazDaemonError,
+    ElhazNotFoundError,
+    ElhazValidationError,
+)
 from elhaz.models import CredentialProcessModel
 
 from ..constants import state
@@ -405,6 +410,63 @@ def whoami_cmd(
     if obscure_values:
         data = obscure(data)
     print_json(data)
+
+
+@app.command("generate-aws-config")
+def generate_aws_config_cmd() -> None:
+    """Print an AWS config file for all elhaz configs.
+
+    Each config becomes a ``[profile <name>]`` block whose
+    ``credential_process`` points at this elhaz installation.  Configs
+    that fail to parse are skipped with a warning written to stderr.
+
+    The output can be redirected directly to ``~/.aws/config``:
+
+        elhaz generate-aws-config > ~/.aws/config
+    """
+
+    try:
+        with Client(state) as client:
+            response = client.send("list")
+    except ElhazDaemonError as exc:
+        print_error(f"Daemon unreachable: {exc}")
+        raise typer.Exit(1)
+
+    if not response.ok:
+        print_error(
+            response.error.message if response.error else "Unknown error."
+        )
+        raise typer.Exit(1)
+
+    names: list[str] = response.data or []
+    if not names:
+        typer.echo("No active sessions.")
+        return
+
+    blocks: list[str] = []
+    for name in names:
+        region: str | None = None
+        try:
+            data = Config(name, state).get()
+            sts = data.get("STS") or {}
+            session = data.get("Session") or {}
+            region = sts.get("region_name") or session.get("region_name")
+        except (ElhazNotFoundError, ElhazValidationError):
+            pass
+
+        cp_cmd = (
+            f"{sys.executable} -m elhaz.cli"
+            f" --socket-path {state.socket_path}"
+            f" export --format credential-process -n {name}"
+        )
+
+        lines = [f"[profile {name}]", f"credential_process = {cp_cmd}"]
+        if region:
+            lines.append(f"region = {region}")
+
+        blocks.append("\n".join(lines))
+
+    typer.echo("\n\n".join(blocks))
 
 
 def main() -> None:

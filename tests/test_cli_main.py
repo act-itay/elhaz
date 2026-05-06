@@ -2,7 +2,8 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-"""Unit tests for elhaz.cli.__main__ (export, exec, shell, whoami)."""
+"""Unit tests for elhaz.cli.__main__ (export, exec, shell, whoami,
+generate-aws-config)."""
 
 from __future__ import annotations
 
@@ -14,7 +15,9 @@ from unittest.mock import MagicMock
 
 from typer.testing import CliRunner
 
+import elhaz.cli.__main__ as cli_main_module
 from elhaz.cli.__main__ import app
+from elhaz.constants import Constants
 from elhaz.exceptions import ElhazDaemonError
 from elhaz.models import ResponseModel
 from tests.conftest import err_response, ok_response
@@ -480,3 +483,137 @@ def test_export_without_obscure_shows_credentials(monkeypatch) -> None:
     result = runner.invoke(app, ["export", "--name", "demo"])
     assert result.exit_code == 0
     assert "AKIATEST" in result.output
+
+
+# ---------------------------------------------------------------------------
+# generate-aws-config
+# ---------------------------------------------------------------------------
+
+ROLE_ARN = "arn:aws:iam::123456789012:role/TestRole"
+_MINIMAL = {"AssumeRole": {"RoleArn": ROLE_ARN}}
+
+
+def _inject_main_state(monkeypatch, tmp_constants: Constants) -> None:
+    """Patch the ``state`` used by the __main__ module."""
+    monkeypatch.setattr(cli_main_module, "state", tmp_constants)
+
+
+def _write_config(
+    tmp_constants: Constants,
+    name: str,
+    payload: dict | None = None,
+) -> None:
+    """Write a config file under *tmp_constants.config_dir*."""
+    from elhaz.config import Config
+
+    cfg = Config(name, tmp_constants)
+    cfg.add(payload or _MINIMAL)
+
+
+def test_generate_aws_config_daemon_unreachable_exits_1(
+    monkeypatch,
+) -> None:
+    _install_fake_client(monkeypatch, [ElhazDaemonError("no daemon")])
+    result = runner.invoke(app, ["generate-aws-config"])
+    assert result.exit_code == 1
+    assert "Daemon unreachable" in result.output
+
+
+def test_generate_aws_config_no_active_sessions(monkeypatch) -> None:
+    _install_fake_client(monkeypatch, [ok_response(data=[])])
+    result = runner.invoke(app, ["generate-aws-config"])
+    assert result.exit_code == 0
+    assert "No active sessions." in result.output
+
+
+def test_generate_aws_config_single_session_no_region(
+    monkeypatch, tmp_constants: Constants
+) -> None:
+    _install_fake_client(monkeypatch, [ok_response(data=["demo"])])
+    _inject_main_state(monkeypatch, tmp_constants)
+    result = runner.invoke(app, ["generate-aws-config"])
+    assert result.exit_code == 0
+    assert "[profile demo]" in result.output
+    assert "credential_process" in result.output
+    assert "-n demo" in result.output
+    assert str(tmp_constants.socket_path) in result.output
+    assert "\nregion = " not in result.output
+
+
+def test_generate_aws_config_sts_region(
+    monkeypatch, tmp_constants: Constants
+) -> None:
+    _install_fake_client(monkeypatch, [ok_response(data=["demo"])])
+    _inject_main_state(monkeypatch, tmp_constants)
+    _write_config(
+        tmp_constants,
+        "demo",
+        {
+            "AssumeRole": {"RoleArn": ROLE_ARN},
+            "STS": {"region_name": "us-east-1"},
+        },
+    )
+    result = runner.invoke(app, ["generate-aws-config"])
+    assert result.exit_code == 0
+    assert "region = us-east-1" in result.output
+
+
+def test_generate_aws_config_session_region_fallback(
+    monkeypatch, tmp_constants: Constants
+) -> None:
+    _install_fake_client(monkeypatch, [ok_response(data=["demo"])])
+    _inject_main_state(monkeypatch, tmp_constants)
+    _write_config(
+        tmp_constants,
+        "demo",
+        {
+            "AssumeRole": {"RoleArn": ROLE_ARN},
+            "Session": {"region_name": "eu-west-1"},
+        },
+    )
+    result = runner.invoke(app, ["generate-aws-config"])
+    assert result.exit_code == 0
+    assert "region = eu-west-1" in result.output
+
+
+def test_generate_aws_config_sts_region_takes_priority(
+    monkeypatch, tmp_constants: Constants
+) -> None:
+    _install_fake_client(monkeypatch, [ok_response(data=["demo"])])
+    _inject_main_state(monkeypatch, tmp_constants)
+    _write_config(
+        tmp_constants,
+        "demo",
+        {
+            "AssumeRole": {"RoleArn": ROLE_ARN},
+            "STS": {"region_name": "us-east-1"},
+            "Session": {"region_name": "eu-west-1"},
+        },
+    )
+    result = runner.invoke(app, ["generate-aws-config"])
+    assert result.exit_code == 0
+    assert "region = us-east-1" in result.output
+    assert "eu-west-1" not in result.output
+
+
+def test_generate_aws_config_multiple_sessions(monkeypatch) -> None:
+    _install_fake_client(monkeypatch, [ok_response(data=["alpha", "beta"])])
+    result = runner.invoke(app, ["generate-aws-config"])
+    assert result.exit_code == 0
+    assert "[profile alpha]" in result.output
+    assert "[profile beta]" in result.output
+    assert "\n\n" in result.output
+
+
+def test_generate_aws_config_only_exposes_daemon_sessions(
+    monkeypatch, tmp_constants: Constants
+) -> None:
+    """Config files on disk that are not loaded in the daemon are excluded."""
+    _install_fake_client(monkeypatch, [ok_response(data=["alpha"])])
+    _inject_main_state(monkeypatch, tmp_constants)
+    _write_config(tmp_constants, "alpha")
+    _write_config(tmp_constants, "beta")  # on disk but not in daemon
+    result = runner.invoke(app, ["generate-aws-config"])
+    assert result.exit_code == 0
+    assert "[profile alpha]" in result.output
+    assert "[profile beta]" not in result.output
